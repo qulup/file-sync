@@ -1,0 +1,42 @@
+# Keep the build context small; the Dockerfile copies api/ wholesale.
+
+# Version control + CI
+.git
+.gitignore
+.gitattributes
+.github
+
+# Local deps / test artifacts
+node_modules
+**/node_modules
+e2e
+tests
+
+# Repo tooling / deploy recipes (the image only needs api/, web/, nginx.conf, docker/)
+deploy
+scripts
+conftest.py
+ruff.toml
+eslint.config.mjs
+package.json
+package-lock.json
+
+# Never ship Python bytecode
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+
+# Docs / editor / misc noise
+*.md
+LICENSE
+.vscode
+.idea
+*.log
+*.tar
+
+# Local secrets and virtualenvs
+.env
+.env.*
+.venv
+venv

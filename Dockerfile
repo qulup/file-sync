@@ -1,11 +1,13 @@
 # Development
 # docker build --no-cache -t filesync --load .
 # docker build --no-cache --platform linux/amd64 -t filesync --output=type=docker,dest=filesync.tar .
+# Releases pass the version: docker build --build-arg VERSION=4.5.0 -t filesync .
 
 # ==============================
 # Stage 1: Build Python dependencies
 # ==============================
-FROM python:3.14-alpine AS builder
+# Python version: keep in step with .python-version (CI checks it).
+FROM python:3.15-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache --virtual .build-deps build-base libffi-dev musl-dev python3-dev
@@ -28,35 +30,51 @@ RUN find /install/lib/ -path "*/site-packages/tests" -type d -exec rm -rf {} + \
 # ==============================
 # Stage 2: Runtime image
 # ==============================
-FROM python:3.14-alpine
+FROM python:3.15-alpine
 
-# Install Nginx runtime (+ bash for a reliable `wait -n` in the start command)
-RUN apk add --no-cache nginx bash
+# Nginx, tini (PID 1: forwards signals and reaps zombies), su-exec (run the backend
+# unprivileged), bash (the entrypoint's `wait -n`: busybox ash's never returns for a child
+# killed by a signal, so a crashed process would go unnoticed).
+# apk upgrade picks up Alpine security fixes that the base image doesn't have yet, and
+# Dependabot can't see.
+RUN apk upgrade --no-cache && apk add --no-cache nginx tini su-exec bash
 
 WORKDIR /filesync
 
+# Never write .pyc at runtime.
+ENV PYTHONDONTWRITEBYTECODE=1
+
 # Copy Python dependencies from builder
 COPY --from=builder /install /usr/local
+
+# Copy Nginx config and the process supervisor script
+COPY nginx.conf /etc/nginx/http.d/default.conf
+COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Copy app code
 COPY api /filesync/api
 COPY --chown=nginx:nginx web /filesync/web
 
-# Copy Nginx config
-COPY nginx.conf /etc/nginx/http.d/default.conf
+# Declared late so a version bump only invalidates the layers below.
+ARG VERSION=dev
+ENV APP_VERSION=$VERSION
 
-# Health check: verify nginx (/) and backend (/health) are both responding
+# Stamp the cache-busting token into the HTML/service worker (assets are served immutable
+# when requested with ?v=). A "dev" build gets a hash of web/ instead, so local rebuilds
+# with changed assets still bust the browser cache. Files without the token are left alone.
+RUN token="$VERSION"; \
+    if [ "$token" = dev ]; then token="dev-$(find web -type f | sort | tr "\n" "\0" | xargs -0 cat | sha256sum | cut -c1-8)"; fi; \
+    for f in web/index.html web/sw.js; do \
+        [ -f "$f" ] && sed -i "s|__APP_VERSION__|$token|g" "$f"; \
+    done; true
+
+# One request through nginx to the backend proves both processes are serving.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -qO /dev/null http://127.0.0.1/ && wget -qO /dev/null http://127.0.0.1:8000/health
+    CMD wget -qO /dev/null http://127.0.0.1/healthz || exit 1
 
 # Expose ports
 EXPOSE 80
 
-# Start FastAPI + Nginx. bash's `wait -n` returns as soon as EITHER process exits, so the
-# container stops (and `restart: unless-stopped` restarts it) if the backend dies —
-# instead of nginx keeping a half-dead container alive indefinitely. (busybox sh's
-# `wait -n` does not reliably fire for a backgrounded child as PID 1, so we use bash.)
-# --ws-max-size caps WebSocket frames at the transport (uvicorn's default is 16 MiB,
-# which would be fully buffered before the app's own 32 KiB payload check runs);
-# 64 KiB leaves headroom over the signaling _MAX_PAYLOAD_BYTES limit.
-CMD ["bash", "-c", "python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --ws-max-size 65536 & nginx -g 'daemon off;' & wait -n"]
+# tini -g signals the whole process group, so `docker stop` reaches uvicorn and nginx at once.
+ENTRYPOINT ["/sbin/tini", "-g", "--"]
+CMD ["/usr/local/bin/entrypoint.sh"]

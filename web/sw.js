@@ -9,9 +9,19 @@
 //   ArrayBuffer | Uint8Array  -> enqueued as a chunk
 //   { type: 'end' }           -> stream is closed cleanly
 //   { type: 'abort' }         -> stream is errored (browser will show an incomplete download)
+//
+// Flow control (worker -> page): a bounded credit window, topped up as the consumer drains.
+//
+// The transfer entry deliberately stays in the map after 'end': in Firefox the
+// navigation's fetch event can arrive AFTER the page finished streaming (fast
+// drain of small staged files), so deleting on 'end' would 404 a download whose
+// bytes are already fully buffered in the closed stream. The fetch handler
+// guards re-serving with `served`; the GC reclaims old entries.
 
 const transfers = new Map();
 const KEEPALIVE_MS = 15_000;
+const WINDOW_CHUNKS = 64;      // max chunks (~16 KiB each => ~1 MiB) buffered in the worker
+const CREDIT_TICK_MS = 50;     // how often freed room is handed back to the page
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
@@ -24,31 +34,59 @@ self.addEventListener('message', (event) => {
   if (!id || !port) return;
 
   let controller;
-  const stream = new ReadableStream({
-    start(c) { controller = c; },
-    cancel() {
-      // User cancelled the download in the browser UI.
-      try { port.postMessage({ type: 'cancel' }); } catch {}
-      transfers.delete(id);
+  let creditsOutstanding = 0;
+  let finished = false;
+
+  const stream = new ReadableStream(
+    {
+      start(c) { controller = c; },
+      cancel() {
+        // User cancelled the download in the browser UI.
+        finished = true;
+        clearInterval(timer);
+        try { port.postMessage({ type: 'cancel' }); } catch {}
+        transfers.delete(id);
+      },
     },
-  });
+    // highWaterMark in chunks, so desiredSize == "chunks of room left in the queue".
+    { highWaterMark: WINDOW_CHUNKS },
+  );
+
+  // Hand the page as much credit as there is room for (never over-grant).
+  function topUp() {
+    if (finished || !controller) return;
+    const room = controller.desiredSize;
+    if (room === null) {
+      // Stream closed/errored (page gone): stop the timer.
+      finished = true;
+      clearInterval(timer);
+      return;
+    }
+    if (room > creditsOutstanding) {
+      const grant = room - creditsOutstanding;
+      creditsOutstanding += grant;
+      try { port.postMessage({ type: 'credit', n: grant }); } catch {}
+    }
+  }
+  const timer = setInterval(topUp, CREDIT_TICK_MS);
 
   port.onmessage = (ev) => {
     const data = ev.data;
-    if (data instanceof ArrayBuffer) {
-      controller.enqueue(new Uint8Array(data));
-      return;
-    }
-    if (ArrayBuffer.isView(data)) {
-      controller.enqueue(data);
+    if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+      if (creditsOutstanding > 0) creditsOutstanding -= 1;   // this chunk consumed a grant
+      try { controller.enqueue(data instanceof ArrayBuffer ? new Uint8Array(data) : data); } catch {}
+      topUp();                                               // room may have freed up
       return;
     }
     if (data && data.type === 'end') {
+      finished = true;
+      clearInterval(timer);
       try { controller.close(); } catch {}
-      transfers.delete(id);
       return;
     }
     if (data && data.type === 'abort') {
+      finished = true;
+      clearInterval(timer);
       try { controller.error(new Error(data.reason || 'aborted')); } catch {}
       transfers.delete(id);
     }
@@ -56,8 +94,9 @@ self.addEventListener('message', (event) => {
 
   transfers.set(id, { name, size, mime: mime || 'application/octet-stream', stream, createdAt: Date.now() });
 
-  // Tell the page we're ready to receive bytes.
+  // Tell the page we're ready to receive bytes, then seed the initial window.
   port.postMessage({ type: 'ready' });
+  topUp();
 });
 
 self.addEventListener('fetch', (event) => {
@@ -67,10 +106,11 @@ self.addEventListener('fetch', (event) => {
 
   const id = match[1];
   const entry = transfers.get(id);
-  if (!entry) {
+  if (!entry || entry.served) {
     event.respondWith(new Response('Transfer not found or expired.', { status: 404 }));
     return;
   }
+  entry.served = true;
 
   const headers = new Headers({
     'Content-Type': entry.mime,
@@ -85,7 +125,7 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(new Response(entry.stream, { headers }));
 });
 
-// Garbage-collect transfers that registered but never had their /__download/{id} fetched.
+// Garbage-collect transfers that were never fetched, or whose download has long finished.
 setInterval(() => {
   const now = Date.now();
   for (const [id, entry] of transfers) {

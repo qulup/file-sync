@@ -22,7 +22,21 @@ updates:
           - "minor"
           - "patch"
 
-  # GitHub Actions used by the release workflow
+  # Deploy recipes (coturn, caddy pins). The app's own image uses latest, so Dependabot
+  # leaves it alone.
+  - package-ecosystem: "docker-compose"
+    directory: "/deploy"
+    schedule:
+      interval: "daily"
+    ignore:
+      - dependency-name: "poliuscorp/filesync"
+    groups:
+      compose-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions (SHA-pinned; Dependabot updates the SHA and the tag comment)
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -36,6 +50,17 @@ updates:
   # End-to-end test harness (Playwright)
   - package-ecosystem: "npm"
     directory: "/e2e"
+    schedule:
+      interval: "daily"
+    groups:
+      npm-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Frontend lint/test tooling (root package.json); otherwise eslint deps never get bumped.
+  - package-ecosystem: "npm"
+    directory: "/"
     schedule:
       interval: "daily"
     groups:
